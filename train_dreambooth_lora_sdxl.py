@@ -379,30 +379,41 @@ def parse_args(input_args=None):
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
     )
-    #     parser.add_argument(
-    #         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
-    #     )
-    #     parser.add_argument(
-    #         "--use_prodigy", action="store_true", help="Whether or not to use Prodigy from https://github.com/konstmish/prodigy."
-    #     )
-
-    #     parser.add_argument(
-    #         "--use_adafactor", action="store_true", help="Whether or not to use Adafactor from https://huggingface.co/docs/transformers/main_classes/optimizer_schedules#transformers.Adafactor."
-    #     )
 
     parser.add_argument(
         "--optimizer",
         type=str,
-        default="adamW",
+        default="prodigy",
         help=(
-            'The optimizer type to use. Choose between ["adamW", "8bit_adam", "prodigy", "adafactor"]'
+            'The optimizer type to use. Choose between ["adamW", "prodigy"]'
         ),
     )
 
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-4, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
+    parser.add_argument(
+        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes. Ignored if "
+                                                     "optimizer is not set to AdamW"
+    )
+
+    parser.add_argument("--adam_beta1", type=float, default=0.9,
+                        help="The beta1 parameter for the Adam and Prodigy optimizers.")
+    parser.add_argument("--adam_beta2", type=float, default=0.999,
+                        help="The beta2 parameter for the Adam and Prodigy optimizers.")
+    parser.add_argument("--prodigy_beta3", type=float, default=None,
+                        help="coefficients for computing the Prodidy stepsize using running averages. If set to None, "
+                             "uses the value of square root of beta2")
+    parser.add_argument("--prodigy_decouple", type=bool, default=True,
+                        help="Use AdamW style decoupled weight decay")
+    parser.add_argument("--adam_weight_decay", type=float, default=1e-02, help="Weight decay to use. If you're using "
+                                                                               "the Adam optimizer you might want to "
+                                                                               "change value to 1e-4")
+
+    parser.add_argument("--adam_epsilon", type=float, default=1e-08,
+                        help="Epsilon value for the Adam optimizer and Prodigy optimizers.")
+
+    parser.add_argument("--prodigy_use_bias_correction ", type=bool, default=False,
+                        help="Turn on Adam's bias correction. Off by default.")
+    parser.add_argument("--prodigy_safeguard_warmup ", type=bool, default=True,
+                        help="Remove lr from the denominator of D estimate to avoid issues during warm-up stage. True by default.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
@@ -569,18 +580,6 @@ class DreamBoothDataset(Dataset):
                     f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
                 )
 
-        # if isinstance(custom_instance_prompts, str):
-        #     custom_instance_prompts = Path(custom_instance_prompts)
-        #     print("path:",custom_instance_prompts)
-        #     if not custom_instance_prompts.exists():
-        #         raise Warning("Instance prompt list/file doesn't exists. Using instance prompt for all captions \
-        #                       instead")
-        #         self.custom_instance_prompts = None
-        #     prompt_file = open(custom_instance_prompts, "r")
-        #     self.custom_instance_prompts = prompt_file.read().splitlines()
-
-        # self.instance_images_path = sorted(list(Path(instance_data_root).iterdir()))
-        print(self.instance_images_path)
         self.num_instance_images = len(self.instance_images_path)
         self._length = self.num_instance_images
 
@@ -1037,91 +1036,76 @@ def main(
         )
 
     # Optimization parameters
+    unet_lora_parameters_with_lr = {"params": unet_lora_parameters, "lr": args.learning_rate}
     if args.text_encoder_lr:  # different learning rate for text encoder and unet
-        unet_lora_parameters_with_lr = {"params": unet_lora_parameters, "lr": args.learning_rate}
         text_lora_parameters_one_with_lr = {"params": text_lora_parameters_one, "lr": args.text_encoder_lr}
         text_lora_parameters_two_with_lr = {"params": text_lora_parameters_two, "lr": args.text_encoder_lr}
-        params_to_optimize = [unet_lora_parameters_with_lr, text_lora_parameters_one_with_lr,
-                              text_lora_parameters_two_with_lr]
 
     else:
-        unet_lora_parameters_with_lr = {"params": unet_lora_parameters, "lr": args.learning_rate}
         text_lora_parameters_one_with_lr = {"params": text_lora_parameters_one, "lr": args.learning_rate}
         text_lora_parameters_two_with_lr = {"params": text_lora_parameters_two, "lr": args.learning_rate}
-        params_to_optimize = [unet_lora_parameters_with_lr, text_lora_parameters_one_with_lr,
-                              text_lora_parameters_two_with_lr]
+
+    params_to_optimize = [unet_lora_parameters_with_lr, text_lora_parameters_one_with_lr,
+                          text_lora_parameters_two_with_lr]
 
     # Optimizer creation
-    # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
-    if args.optimizer.lower() == "8bit_adam":
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
-            )
+    if args.use_8bit_adam and not args.optimizer.lower() == "AdamW":
+        logger.warn(f"use_8bit_adam is ignored when optimizer is not set to 'AdamW'. Optimizer was "
+                    f"set to {args.optimizer.lower()}")
 
-        optimizer_class = bnb.optim.AdamW8bit
-        optimizer = optimizer_class(
-            params_to_optimize,
-            betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-        )
-
-    elif args.optimizer.lower() == "prodigy":
+    if args.optimizer.lower() == "prodigy":
         try:
             import prodigyopt
         except ImportError:
             raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
 
         optimizer_class = prodigyopt.Prodigy
-        # todo add if for different lr for text encdoer training + lr <=0.1
+
+        if args.learning_rate <= 0.1:
+            logger.warn(
+                f"Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
+            )
+        if args.text_encoder_lr:
+            logger.warn(
+                f"Learning rates were provided both for the unet and the text encdoer- e.g. text_encoder_lr and learning_rate"
+                f"when using prodigy only learning_rate is used as the initial learning rate"
+            )
+
         optimizer = optimizer_class(
             params_to_optimize,
-            # lr=1.,
-            weight_decay=0.01,
-            use_bias_correction=True,
-            safeguard_warmup=True,
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            beta3=args.prodigy_beta3,
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+            decouple=args.prodigy_decouple,
+            use_bias_correction=args.prodigy_use_bias_correction,
+            safeguard_warmup=args.prodigy_safeguard_warmup,
         )
 
-    elif args.optimizer.lower() == "adafactor":
-        optimizer_class = transformers.optimization.Adafactor
-        optimizer = optimizer_class(
-            params_to_optimize,
-        )
 
-    else:  # AdamW
-        optimizer_class = torch.optim.AdamW
+    elif args.optimizer.lower() == "AdamW":
+        if args.use_8bit_adam:
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                raise ImportError(
+                    "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
+                )
+
+            optimizer_class = bnb.optim.AdamW8bit
+        else:
+            optimizer_class = torch.optim.AdamW
+
         optimizer = optimizer_class(
             params_to_optimize,
             betas=(args.adam_beta1, args.adam_beta2),
             weight_decay=args.adam_weight_decay,
             eps=args.adam_epsilon,
         )
-
-    # if args.use_prodigy:
-    #     optimizer = optimizer_class(
-    #         params_to_optimize,
-    #         # lr=1.,
-    #         weight_decay=0.01,
-    #         use_bias_correction = True,
-    #         safeguard_warmup=True,
-    #     )
-    # elif args.use_adafactor:
-    #     optimizer = optimizer_class(
-    #         params_to_optimize,
-    #         # beta=args.adam_beta1,
-    #         # weight_decay=args.adam_weight_decay,
-    #         # eps=args.adam_epsilon,
-    #     )
-    # else:
-    #     optimizer = optimizer_class(
-    #         params_to_optimize,
-    #         betas=(args.adam_beta1, args.adam_beta2),
-    #         weight_decay=args.adam_weight_decay,
-    #         eps=args.adam_epsilon,
-    # )
+    else:
+        raise ValueError(
+            f"Unsupported choice of optimizer: {args.optimizer.lower()}. Supported optimizers include [adamW, prodigy]")
 
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
@@ -1218,10 +1202,6 @@ def main(
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
-
-    # if args.use_adafactor:
-    #     lr_scheduler = transformers.optimization.AdafactorSchedule(optimizer=optimizer,
-    #                                                                initial_lr=args.learning_rate)
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
