@@ -41,6 +41,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+from datasets import load_dataset
 
 import diffusers
 from diffusers import (
@@ -141,12 +142,41 @@ def parse_args(input_args=None):
         help="Revision of pretrained model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help=(
+            "The name of the Dataset (from the HuggingFace hub) containing the training data of instance images (could be your own, possibly private,"
+            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
+            " or to a folder containing files that 🤗 Datasets can understand."
+        ),
+    )
+    parser.add_argument(
+        "--dataset_config_name",
+        type=str,
+        default=None,
+        help="The config of the Dataset, leave as None if there's only one config.",
+    )
+    parser.add_argument(
         "--instance_data_dir",
         type=str,
         default=None,
-        required=True,
-        help="A folder containing the training data of instance images.",
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
     )
+    parser.add_argument(
+        "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
+    )
+    parser.add_argument(
+        "--caption_column",
+        type=str,
+        default="text",
+        help="The column of the dataset containing the instance prompt for each image",
+    )
+
     parser.add_argument(
         "--class_data_dir",
         type=str,
@@ -473,6 +503,8 @@ class DreamBoothDataset(Dataset):
     def __init__(
             self,
             instance_data_root,
+            instance_prompt,
+            class_prompt,
             class_data_root=None,
             class_num=None,
             size=1024,
@@ -482,10 +514,73 @@ class DreamBoothDataset(Dataset):
         self.center_crop = center_crop
 
         self.instance_data_root = Path(instance_data_root)
-        if not self.instance_data_root.exists():
-            raise ValueError("Instance images root doesn't exists.")
 
-        self.instance_images_path = list(Path(instance_data_root).iterdir())
+        self.instance_prompt = instance_prompt
+        self.custom_instance_prompts = None
+        self.class_prompt = class_prompt
+
+        if args.dataset_name is not None:
+            # Downloading and loading a dataset from the hub.
+            # See more about loading custom images at
+            # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
+            dataset = load_dataset(
+                instance_dataset_name,
+                args.dataset_config_name,
+                cache_dir=args.cache_dir,
+            )
+        else:
+            if not self.instance_data_root.exists():
+                raise ValueError("Instance images root doesn't exists.")
+
+            dataset = load_dataset('imagefolder',
+                                   data_dir=instance_data_root,
+                                   cache_dir=args.cache_dir,
+                                   )
+
+        # Preprocessing the datasets.
+        # We need to tokenize inputs and targets.
+        print(dataset.column_names)
+        column_names = dataset["train"].column_names
+
+        # 6. Get the column names for input/target.
+        if args.image_column is None:
+            image_column = column_names[0]
+            logger.info(f"image column defaulting to {image_column}")
+        else:
+            image_column = args.image_column
+            if image_column not in column_names:
+                raise ValueError(
+                    f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                )
+        self.instance_images_path = dataset["train"][image_column]
+
+        if args.caption_column is None:
+            try:
+                caption_column = column_names[1]
+                logger.info(f"caption column defaulting to {caption_column}")
+                self.custom_instance_prompts = dataset["train"][caption_column]
+            except Indexerror:
+                logger.info(f"no caption column provided, deaulting to instance_prompt for all images")
+                self.custom_instance_prompts = None
+        else:
+            caption_column = args.caption_column
+            if caption_column not in column_names:
+                raise ValueError(
+                    f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                )
+
+        # if isinstance(custom_instance_prompts, str):
+        #     custom_instance_prompts = Path(custom_instance_prompts)
+        #     print("path:",custom_instance_prompts)
+        #     if not custom_instance_prompts.exists():
+        #         raise Warning("Instance prompt list/file doesn't exists. Using instance prompt for all captions \
+        #                       instead")
+        #         self.custom_instance_prompts = None
+        #     prompt_file = open(custom_instance_prompts, "r")
+        #     self.custom_instance_prompts = prompt_file.read().splitlines()
+
+        # self.instance_images_path = sorted(list(Path(instance_data_root).iterdir()))
+        print(self.instance_images_path)
         self.num_instance_images = len(self.instance_images_path)
         self._length = self.num_instance_images
 
@@ -494,7 +589,6 @@ class DreamBoothDataset(Dataset):
             self.class_data_root.mkdir(parents=True, exist_ok=True)
             self.class_images_path = list(self.class_data_root.iterdir())
             if class_num is not None:
-                print("OK")
                 self.num_class_images = min(len(self.class_images_path), class_num)
             else:
                 self.num_class_images = len(self.class_images_path)
@@ -516,12 +610,23 @@ class DreamBoothDataset(Dataset):
 
     def __getitem__(self, index):
         example = {}
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
+        # instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
+        instance_image = self.instance_images_path[index % self.num_instance_images]
         instance_image = exif_transpose(instance_image)
 
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
+
+        if self.custom_instance_prompts:
+            caption = self.custom_instance_prompts[index % self.num_instance_images]
+            if caption:
+                example["instance_prompt"] = self.custom_instance_prompts[index % self.num_instance_images]
+            else:
+                example["instance_prompt"] = self.instance_prompt
+
+        else:  # costum prompts were provided, but length does not match size of image dataset
+            example["instance_prompt"] = self.instance_prompt
 
         if self.class_data_root:
             class_image = Image.open(self.class_images_path[index % self.num_class_images])
@@ -530,22 +635,25 @@ class DreamBoothDataset(Dataset):
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
+            example["class_prompt"] = self.class_prompt
 
         return example
 
 
 def collate_fn(examples, with_prior_preservation=False):
     pixel_values = [example["instance_images"] for example in examples]
+    prompts = [example["instance_prompt"] for example in examples]
 
     # Concat class and instance examples for prior preservation.
     # We do this to avoid doing two forward passes.
     if with_prior_preservation:
         pixel_values += [example["class_images"] for example in examples]
+        prompts += [example["class_prompt"] for example in examples]
 
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    batch = {"pixel_values": pixel_values}
+    batch = {"pixel_values": pixel_values, "prompts": prompts}
     return batch
 
 
@@ -1015,6 +1123,25 @@ def main(
     #         eps=args.adam_epsilon,
     # )
 
+    # Dataset and DataLoaders creation:
+    train_dataset = DreamBoothDataset(
+        instance_data_root=args.instance_data_dir,
+        instance_prompt=args.instance_prompt,
+        class_prompt=args.class_prompt,
+        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+        class_num=args.num_class_images,
+        size=args.resolution,
+        center_crop=args.center_crop,
+    )
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+        num_workers=args.dataloader_num_workers,
+    )
+
     # Computes additional embeddings/ids required by the SDXL UNet.
     # regular text emebddings (when `train_text_encoder` is not True)
     # pooled text embeddings
@@ -1041,9 +1168,10 @@ def main(
                 pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
             return prompt_embeds, pooled_prompt_embeds
 
-    # Handle instance prompt.
+    # Handle instance prompt. If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images), we encode the instance prompt once to avoid
+    # the redundant encoding.
     instance_time_ids = compute_time_ids()
-    if not args.train_text_encoder:
+    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
         instance_prompt_hidden_states, instance_pooled_prompt_embeds = compute_text_embeddings(
             args.instance_prompt, text_encoders, tokenizers
         )
@@ -1056,49 +1184,33 @@ def main(
                 args.class_prompt, text_encoders, tokenizers
             )
 
-    # Clear the memory here.
-    if not args.train_text_encoder:
+    # Clear the memory here
+    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
         del tokenizers, text_encoders
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Pack the statically computed variables appropriately. This is so that we don't
+    # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images), pack the statically computed variables appropriately here. This is so that we don't
     # have to pass them to the dataloader.
     add_time_ids = instance_time_ids
     if args.with_prior_preservation:
         add_time_ids = torch.cat([add_time_ids, class_time_ids], dim=0)
 
-    if not args.train_text_encoder:
-        prompt_embeds = instance_prompt_hidden_states
-        unet_add_text_embeds = instance_pooled_prompt_embeds
-        if args.with_prior_preservation:
-            prompt_embeds = torch.cat([prompt_embeds, class_prompt_hidden_states], dim=0)
-            unet_add_text_embeds = torch.cat([unet_add_text_embeds, class_pooled_prompt_embeds], dim=0)
-    else:
-        tokens_one = tokenize_prompt(tokenizer_one, args.instance_prompt)
-        tokens_two = tokenize_prompt(tokenizer_two, args.instance_prompt)
-        if args.with_prior_preservation:
-            class_tokens_one = tokenize_prompt(tokenizer_one, args.class_prompt)
-            class_tokens_two = tokenize_prompt(tokenizer_two, args.class_prompt)
-            tokens_one = torch.cat([tokens_one, class_tokens_one], dim=0)
-            tokens_two = torch.cat([tokens_two, class_tokens_two], dim=0)
-
-    # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_num=args.num_class_images,
-        size=args.resolution,
-        center_crop=args.center_crop,
-    )
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
-        num_workers=args.dataloader_num_workers,
-    )
+    if not train_dataset.custom_instance_prompts:
+        if not args.train_text_encoder:
+            prompt_embeds = instance_prompt_hidden_states
+            unet_add_text_embeds = instance_pooled_prompt_embeds
+            if args.with_prior_preservation:
+                prompt_embeds = torch.cat([prompt_embeds, class_prompt_hidden_states], dim=0)
+                unet_add_text_embeds = torch.cat([unet_add_text_embeds, class_pooled_prompt_embeds], dim=0)
+        else:
+            tokens_one = tokenize_prompt(tokenizer_one, args.instance_prompt)
+            tokens_two = tokenize_prompt(tokenizer_two, args.instance_prompt)
+            if args.with_prior_preservation:
+                class_tokens_one = tokenize_prompt(tokenizer_one, args.class_prompt)
+                class_tokens_two = tokenize_prompt(tokenizer_two, args.class_prompt)
+                tokens_one = torch.cat([tokens_one, class_tokens_one], dim=0)
+                tokens_two = torch.cat([tokens_two, class_tokens_two], dim=0)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -1199,6 +1311,26 @@ def main(
 
             with accelerator.accumulate(unet):
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
+                prompts = batch["prompts"]
+                print(prompts)
+
+                # encode batch prompts when custom prompts are provided for each image -
+                if train_dataset.custom_instance_prompts:
+
+                    if not args.train_text_encoder:
+                        prompt_embeds, unet_add_text_embeds = compute_text_embeddings(
+                            prompts, text_encoders, tokenizers)
+                        if args.with_prior_preservation:
+                            prompt_embeds_input = torch.cat([prompt_embeds, class_prompt_hidden_states], dim=0)
+                            unet_add_text_embeds = torch.cat([unet_add_text_embeds, class_pooled_prompt_embeds], dim=0)
+                    else:
+                        tokens_one = tokenize_prompt(tokenizer_one, prompts)
+                        tokens_two = tokenize_prompt(tokenizer_two, prompts)
+                        if args.with_prior_preservation:
+                            class_tokens_one = tokenize_prompt(tokenizer_one, args.class_prompt)
+                            class_tokens_two = tokenize_prompt(tokenizer_two, args.class_prompt)
+                            tokens_one = torch.cat([tokens_one, class_tokens_one], dim=0)
+                            tokens_two = torch.cat([tokens_two, class_tokens_two], dim=0)
 
                 # Convert images to latent space
                 model_input = vae.encode(pixel_values).latent_dist.sample()
@@ -1228,7 +1360,10 @@ def main(
                         "time_ids": add_time_ids.repeat(elems_to_repeat, 1),
                         "text_embeds": unet_add_text_embeds.repeat(elems_to_repeat, 1),
                     }
-                    prompt_embeds_input = prompt_embeds.repeat(elems_to_repeat, 1, 1)
+                    if not dataset.custom_instance_prompts:  # i.e. we only encoded args.instance_prompt
+                        prompt_embeds_input = prompt_embeds.repeat(elems_to_repeat, 1, 1)
+                    else:
+                        prompt_embeds_input = prompt_embeds
                     model_pred = unet(
                         noisy_model_input,
                         timesteps,
