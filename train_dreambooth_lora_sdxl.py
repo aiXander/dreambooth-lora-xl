@@ -405,11 +405,29 @@ def parse_args(input_args=None):
     )
 
     parser.add_argument(
+        "--train_text_encoder_ti_frac",
+        type=float,
+        default=0.5,
+        help=(
+            'The percentage of epochs to perform textual inversion'
+        ),
+    )
+
+    parser.add_argument(
+        "--train_text_encoder_frac",
+        type=float,
+        default=0.5,
+        help=(
+            'The percentage of epochs to perform text encoder tuning'
+        ),
+    )
+
+    parser.add_argument(
         "--optimizer",
         type=str,
         default="prodigy",
         help=(
-            'The optimizer type to use. Choose between ["adamW", "prodigy"]'
+            'The optimizer type to use. Choose between ["AdamW", "prodigy"]'
         ),
     )
 
@@ -1002,18 +1020,18 @@ def main(args):
         for name, param in text_encoder_one.named_parameters():
             if "token_embedding" in name:
                 param.requires_grad = True
-                print(name)
+                # print(name)
                 text_lora_parameters_one.append(param)
-            else:
-                param.requires_grad = False
+            # else:
+            #     param.requires_grad = False
         text_lora_parameters_two = []
         for name, param in text_encoder_two.named_parameters():
             if "token_embedding" in name:
                 param.requires_grad = True
-                print(name)
+                # print(name)
                 text_lora_parameters_two.append(param)
-            else:
-                param.requires_grad = False
+            # else:
+            #     param.requires_grad = False
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
@@ -1043,7 +1061,6 @@ def main(args):
                 text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
                 text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
             )
-
 
     def load_model_hook(models, input_dir):
         unet_ = None
@@ -1348,22 +1365,47 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
+    if args.train_text_encoder:
+        num_train_epochs_text_encoder = int(args.train_text_encoder_frac * args.num_train_epochs)
+    elif args.train_text_encoder_ti:  # args.train_text_encoder_ti
+        num_train_epochs_text_encoder = int(args.train_text_encoder_ti_frac * args.num_train_epochs)
+
     for epoch in range(first_epoch, args.num_train_epochs):
+        # if performing any kind of optimization of text_encoder params
+        if args.train_text_encoder or args.train_text_encoder_ti:
+            if epoch == num_train_epochs_text_encoder:
+                print("PIVOT HALFWAY", epoch)
+                # stopping optimization of text_encoder params
+                params_to_optimize = params_to_optimize[:1]
+                # reinitializing the optimizer to optimize only on unet params
+                if args.optimizer.lower() == "prodigy":
+                    optimizer = optimizer_class(
+                        params_to_optimize,
+                        lr=args.learning_rate,
+                        betas=(args.adam_beta1, args.adam_beta2),
+                        beta3=args.prodigy_beta3,
+                        weight_decay=args.adam_weight_decay,
+                        eps=args.adam_epsilon,
+                        decouple=args.prodigy_decouple,
+                        use_bias_correction=args.prodigy_use_bias_correction,
+                        safeguard_warmup=args.prodigy_safeguard_warmup,
+                    )
+                else:  # AdamW or 8-bit-AdamW
+                    optimizer = optimizer_class(
+                        params_to_optimize,
+                        betas=(args.adam_beta1, args.adam_beta2),
+                        weight_decay=args.adam_weight_decay,
+                        eps=args.adam_epsilon,
+                    )
+            else:  # still optimizng the text encoder
+                # set top parameter requires_grad = True for gradient checkpointing works
+                if args.train_text_encoder:
+                    text_encoder_one.train()
+                    text_encoder_two.train()
+                    text_encoder_one.text_model.embeddings.requires_grad_(True)
+                    text_encoder_two.text_model.embeddings.requires_grad_(True)
+
         unet.train()
-        if args.train_text_encoder:
-            text_encoder_one.train()
-            text_encoder_two.train()
-            # set top parameter requires_grad = True for gradient checkpointing works
-            text_encoder_one.text_model.embeddings.requires_grad_(True)
-            text_encoder_two.text_model.embeddings.requires_grad_(True)
-
-        elif args.train_text_encoder_ti:
-            text_encoder_one.train()
-            text_encoder_two.train()
-            # set top parameter requires_grad = True for gradient checkpointing works
-            # text_encoder_one.text_model.embeddings.token_embedding.requires_grad_(True)
-            # text_encoder_two.text_model.embeddings.token_embedding.requires_grad_(True)
-
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
@@ -1700,7 +1742,6 @@ def main(args):
             )
 
     accelerator.end_training()
-
 
 if __name__ == "__main__":
     args = parse_args()
