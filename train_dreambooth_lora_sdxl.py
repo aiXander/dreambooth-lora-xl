@@ -1397,11 +1397,12 @@ def main(args):
                         weight_decay=args.adam_weight_decay,
                         eps=args.adam_epsilon,
                     )
-            else:  # still optimizng the text encoder
+            else:
+                # still optimizng the text encoder
+                text_encoder_one.train()
+                text_encoder_two.train()
                 # set top parameter requires_grad = True for gradient checkpointing works
                 if args.train_text_encoder:
-                    text_encoder_one.train()
-                    text_encoder_two.train()
                     text_encoder_one.text_model.embeddings.requires_grad_(True)
                     text_encoder_two.text_model.embeddings.requires_grad_(True)
 
@@ -1537,6 +1538,11 @@ def main(args):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+
+                # every step, we reset the embeddings to the original embeddings.
+                if args.train_text_encoder_ti:
+                    for idx, text_encoder in enumerate(text_encoders):
+                        embedding_handler.retract_embeddings()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
