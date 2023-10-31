@@ -58,6 +58,20 @@ from diffusers.training_utils import unet_lora_state_dict
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+import fnmatch
+import json
+import math
+import os
+import shutil
+from typing import List, Optional
+
+#imports of the TokenEmbeddingsHandler class
+import torch.utils.checkpoint
+from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProcessor2_0
+from diffusers.optimization import get_scheduler
+from safetensors.torch import save_file
+from tqdm.auto import tqdm
+
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
 
@@ -728,6 +742,141 @@ def compute_snr(timesteps):
     return snr
 
 
+class TokenEmbeddingsHandler:
+    def __init__(self, text_encoders, tokenizers):
+        self.text_encoders = text_encoders
+        self.tokenizers = tokenizers
+
+        self.train_ids: Optional[torch.Tensor] = None
+        self.inserting_toks: Optional[List[str]] = None
+        self.embeddings_settings = {}
+
+    def initialize_new_tokens(self, inserting_toks: List[str]):
+        idx = 0
+        for tokenizer, text_encoder in zip(self.tokenizers, self.text_encoders):
+            assert isinstance(
+                inserting_toks, list
+            ), "inserting_toks should be a list of strings."
+            assert all(
+                isinstance(tok, str) for tok in inserting_toks
+            ), "All elements in inserting_toks should be strings."
+
+            self.inserting_toks = inserting_toks
+            special_tokens_dict = {"additional_special_tokens": self.inserting_toks}
+            tokenizer.add_special_tokens(special_tokens_dict)
+            text_encoder.resize_token_embeddings(len(tokenizer))
+
+            self.train_ids = tokenizer.convert_tokens_to_ids(self.inserting_toks)
+
+            # random initialization of new tokens
+            std_token_embedding = (
+                text_encoder.text_model.embeddings.token_embedding.weight.data.std()
+            )
+
+            print(f"{idx} text encodedr's std_token_embedding: {std_token_embedding}")
+
+            text_encoder.text_model.embeddings.token_embedding.weight.data[
+                self.train_ids
+            ] = (
+                    torch.randn(
+                        len(self.train_ids), text_encoder.text_model.config.hidden_size
+                    )
+                    .to(device=self.device)
+                    .to(dtype=self.dtype)
+                    * std_token_embedding
+            )
+            self.embeddings_settings[
+                f"original_embeddings_{idx}"
+            ] = text_encoder.text_model.embeddings.token_embedding.weight.data.clone()
+            self.embeddings_settings[f"std_token_embedding_{idx}"] = std_token_embedding
+
+            inu = torch.ones((len(tokenizer),), dtype=torch.bool)
+            inu[self.train_ids] = False
+
+            self.embeddings_settings[f"index_no_updates_{idx}"] = inu
+
+            print(self.embeddings_settings[f"index_no_updates_{idx}"].shape)
+
+            idx += 1
+
+    def save_embeddings(self, file_path: str):
+        assert (
+                self.train_ids is not None
+        ), "Initialize new tokens before saving embeddings."
+        tensors = {}
+        for idx, text_encoder in enumerate(self.text_encoders):
+            assert text_encoder.text_model.embeddings.token_embedding.weight.data.shape[
+                       0
+                   ] == len(self.tokenizers[0]), "Tokenizers should be the same."
+            new_token_embeddings = (
+                text_encoder.text_model.embeddings.token_embedding.weight.data[
+                    self.train_ids
+                ]
+            )
+            tensors[f"text_encoders_{idx}"] = new_token_embeddings
+
+        save_file(tensors, file_path)
+
+    @property
+    def dtype(self):
+        return self.text_encoders[0].dtype
+
+    @property
+    def device(self):
+        return self.text_encoders[0].device
+
+    def _load_embeddings(self, loaded_embeddings, tokenizer, text_encoder):
+        # Assuming new tokens are of the format <s_i>
+        self.inserting_toks = [f"<s{i}>" for i in range(loaded_embeddings.shape[0])]
+        special_tokens_dict = {"additional_special_tokens": self.inserting_toks}
+        tokenizer.add_special_tokens(special_tokens_dict)
+        text_encoder.resize_token_embeddings(len(tokenizer))
+
+        self.train_ids = tokenizer.convert_tokens_to_ids(self.inserting_toks)
+        assert self.train_ids is not None, "New tokens could not be converted to IDs."
+        text_encoder.text_model.embeddings.token_embedding.weight.data[
+            self.train_ids
+        ] = loaded_embeddings.to(device=self.device).to(dtype=self.dtype)
+
+    @torch.no_grad()
+    def retract_embeddings(self):
+        for idx, text_encoder in enumerate(self.text_encoders):
+            index_no_updates = self.embeddings_settings[f"index_no_updates_{idx}"]
+            text_encoder.text_model.embeddings.token_embedding.weight.data[
+                index_no_updates
+            ] = (
+                self.embeddings_settings[f"original_embeddings_{idx}"][index_no_updates]
+                    .to(device=text_encoder.device)
+                    .to(dtype=text_encoder.dtype)
+            )
+
+            # for the parts that were updated, we need to normalize them
+            # to have the same std as before
+            std_token_embedding = self.embeddings_settings[f"std_token_embedding_{idx}"]
+
+            index_updates = ~index_no_updates
+            new_embeddings = (
+                text_encoder.text_model.embeddings.token_embedding.weight.data[
+                    index_updates
+                ]
+            )
+            off_ratio = std_token_embedding / new_embeddings.std()
+
+            new_embeddings = new_embeddings * (off_ratio ** 0.1)
+            text_encoder.text_model.embeddings.token_embedding.weight.data[
+                index_updates
+            ] = new_embeddings
+
+    def load_embeddings(self, file_path: str):
+        with safe_open(file_path, framework="pt", device=self.device.type) as f:
+            for idx in range(len(self.text_encoders)):
+                text_encoder = self.text_encoders[idx]
+                tokenizer = self.tokenizers[idx]
+
+                loaded_embeddings = f.get_tensor(f"text_encoders_{idx}")
+                self._load_embeddings(loaded_embeddings, tokenizer, text_encoder)
+
+
 class PromptDataset(Dataset):
     "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
 
@@ -1022,16 +1171,16 @@ def main(args):
                 param.requires_grad = True
                 # print(name)
                 text_lora_parameters_one.append(param)
-            # else:
-            #     param.requires_grad = False
+            else:
+                param.requires_grad = False
         text_lora_parameters_two = []
         for name, param in text_encoder_two.named_parameters():
             if "token_embedding" in name:
                 param.requires_grad = True
                 # print(name)
                 text_lora_parameters_two.append(param)
-            # else:
-            #     param.requires_grad = False
+            else:
+                param.requires_grad = False
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
@@ -1748,6 +1897,7 @@ def main(args):
             )
 
     accelerator.end_training()
+
 
 if __name__ == "__main__":
     args = parse_args()
