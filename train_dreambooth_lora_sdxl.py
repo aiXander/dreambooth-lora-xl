@@ -466,7 +466,7 @@ def parse_args(input_args=None):
     parser.add_argument("--adam_epsilon", type=float, default=1e-08,
                         help="Epsilon value for the Adam optimizer and Prodigy optimizers.")
 
-    parser.add_argument("--prodigy_use_bias_correction ", type=bool, default=True,
+    parser.add_argument("--prodigy_use_bias_correction", type=bool, default=True,
                         help="Turn on Adam's bias correction. True by default.")
     parser.add_argument("--prodigy_safeguard_warmup ", type=bool, default=True,
                         help="Remove lr from the denominator of D estimate to avoid issues during warm-up stage. True by default.")
