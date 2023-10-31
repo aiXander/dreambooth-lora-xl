@@ -1608,7 +1608,7 @@ def main(args):
                         "time_ids": add_time_ids.repeat(elems_to_repeat, 1),
                         "text_embeds": unet_add_text_embeds.repeat(elems_to_repeat, 1),
                     }
-                    if not dataset.custom_instance_prompts:  # i.e. we only encoded --instance_prompt
+                    if not train_dataset.custom_instance_prompts:  # i.e. we only encoded --instance_prompt
                         prompt_embeds_input = prompt_embeds.repeat(elems_to_repeat, 1, 1)
 
                     model_pred = unet(
