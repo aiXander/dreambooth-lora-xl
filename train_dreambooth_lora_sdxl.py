@@ -1153,6 +1153,9 @@ def main(args):
 
     # The text encoder comes from 🤗 transformers, so we cannot directly modify it.
     # So, instead, we monkey-patch the forward calls of its attention-blocks.
+    text_lora_parameters_one = []
+    text_lora_parameters_two = []
+
     if args.train_text_encoder:
         # ensure that dtype is float32, even if rest of the model that isn't trained is loaded in fp16
         text_lora_parameters_one = LoraLoaderMixin._modify_text_encoder(
@@ -1165,7 +1168,6 @@ def main(args):
     # if we use textual inversion, we freeze all parameters except for the token embeddings
     # in text encoder
     elif args.train_text_encoder_ti:
-        text_lora_parameters_one = []
         for name, param in text_encoder_one.named_parameters():
             if "token_embedding" in name:
                 param.requires_grad = True
@@ -1173,7 +1175,6 @@ def main(args):
                 text_lora_parameters_one.append(param)
             else:
                 param.requires_grad = False
-        text_lora_parameters_two = []
         for name, param in text_encoder_two.named_parameters():
             if "token_embedding" in name:
                 param.requires_grad = True
